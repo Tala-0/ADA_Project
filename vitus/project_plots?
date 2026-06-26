@@ -1,0 +1,344 @@
+import sys
+sys.path.append("path to the folder where you stored constants.py from the MSW github repository")
+
+import numpy as np
+import dapper as dp
+import dapper.da_methods as da
+# from constants import *
+import matplotlib.pyplot as plt
+
+n = 1000                                                    # number of gridpoints
+dte = 75                                                    # time step between assimilations of observations in DA, corresponds to 5 model minutes
+nens = 500                                                  # original number of ensemble members (number used for DA)                  
+ncyc = 50                                                   # number of DA cycles
+split = 100                                                 # used for separating ensemble so equal number(split) of members in each data file
+multiply = 200                                              # factor by which to increase ensemble size after DA initialisation. Each data file will have split*multiply number of members
+save_directory = ''                                         # where to save netCDF data files                                   
+dx = 500.0                                                  # horizontal resolution of 500
+dy = 500.0                                                  # vertical resolution
+dts = 4.0                                                   # timestep used in discretisation
+g = 10                                                      # gravitational constant
+h_cloud = 90.02                                             # height threshold for cloud formation
+phic = 899.77                                               # geopotential constant value above first threshold to allow for unstable convection.
+h_0 = 90.0                                                  # resting height of fluid
+gamma = g*h_0                                               # weight for negative buoyancy of rain (c in paper) 
+h_rain = 90.4                                               # height threshold for rain
+beta = 0.1                                                  # lag between cloud and rain formation.
+alpha = 0.00014                                             # half-life of influence of rain of roughly 1 hour 
+kr = 10.0                                                   # diffusion constant for rain.
+hw = 5                                                      # half width of mountain ridge
+amp = 1.2                                                   # amplitude of mountain ridge
+mu = n/2                                                    # centre point of mountain ridge
+t = 60                                                      # Number of timesteps in each netCDF file.
+filter_parameter = 0.7                                      # RAW filter reduces computational mode.
+alpha_filt = 0.53                                           # Want just above 0.5 to be conditionally stable. For RAW filter
+tf = 60                                                     # timesteps between saved timesteps. This corresponds to 4 model minutes 
+
+
+sig = [0.001, 0.01, 1.5]                                    # For DA. Noise added to truth to create observations
+H = np.arange(3*n)
+loc_radius = 4                                              # localisation radius for DA
+mindex = 0                                                  # mountain index - 0: flat orography, 1: bell-shaped mountain, 2: power spectrum with sine envelope
+nindex = 1                                                  # noise index - 0: no random pertubational noise in boundary layer, 1: random noise
+n_array = np.array([[4,0.00895,0,n]])
+#n_array = np.array([[4,0.005,0,n-1],[6,0.00,60,90]])    # info of random noise if nindex = 1. Each row indicates a location of noise in the order 
+                                                         # [sigma (half width) of the noise field,amplitude, start, end of location where the model can randomnly selcet the noise position 
+                                                         # Currently perturbations in whole domain like original (first row). 
+                                                         # Standard amplitude = 0.00895. change to 0.000008 if mindex = 1.
+
+rdiag = np.zeros((3*n),dtype='float32')                  # for DA
+for i in range(3):
+    rdiag[i*n:(i+1)*n] = sig[i]**2
+rdiag = rdiag[H]
+
+# NOTE: Dynamics without orography here...
+# =============================================================================
+# 1. Dapper step function
+# =============================================================================
+def dxdt(x):
+    """
+    x: shape (3*n,) or (N_ens, 3*n)
+    Returns tendency, same shape as input.
+    """
+    ku = 2000    # diffusion constant for u
+    kh = 6000    # diffusion coefficient for h
+    
+    # Normalize to 2D: (N_ens, 3*n)
+    single = x.ndim == 1
+    if single:
+        x = x[np.newaxis, :]   # (1, 3*n)
+    N_ens = x.shape[0]
+
+    # Unpack into padded arrays with ghost cells
+    u = np.zeros((N_ens, n + 2))
+    h = np.zeros((N_ens, n + 2))
+    r = np.zeros((N_ens, n + 2))
+
+    u[:, 1:n+1] = x[:, 0:n]
+    h[:, 1:n+1] = x[:, n:2*n]
+    r[:, 1:n+1] = x[:, 2*n:3*n]
+
+    # Periodic BCs
+    u[:, 0], u[:, n+1] = u[:, n], u[:, 1]
+    h[:, 0], h[:, n+1] = h[:, n], h[:, 1]
+    r[:, 0], r[:, n+1] = r[:, n], r[:, 1]
+
+    # Geopotential
+    phi = np.zeros((N_ens, n + 2))
+    phi[:, 1:n+1] = np.where(h[:, 1:n+1] > h_cloud, phic, g * h[:, 1:n+1])
+    phi[:, 0]   = phi[:, n]
+    phi[:, n+1] = phi[:, 1]
+    phi += gamma * r
+
+    # Momentum tendency
+    du = (
+        - (1/(2*dx)) * (u[:, 2:n+2]**2 - u[:, 0:n]**2)
+        - (2/dx)     * (phi[:, 1:n+1] - phi[:, 0:n])
+        + (ku/dx**2) * (u[:, 2:n+2] - 2*u[:, 1:n+1] + u[:, 0:n])
+    )
+
+    # Continuity tendency
+    dh = (
+        - (1/dx) * (u[:, 2:n+2]*(h[:, 1:n+1]+h[:, 2:n+2]) - u[:, 1:n+1]*(h[:, 0:n]+h[:, 1:n+1]))
+        + (kh/dx**2) * (h[:, 2:n+2] - 2*h[:, 1:n+1] + h[:, 0:n])
+    )
+
+    # Rain source
+    mask = np.logical_and(h[:, 1:n+1] > h_rain, u[:, 2:n+2] - u[:, 1:n+1] < 0)
+    beta_loc = np.where(mask, beta, 0.0)
+
+    dr = (
+        - (1/(2*dx)) * (u[:, 2:n+2] + u[:, 1:n+1]) * (r[:, 2:n+2] - r[:, 0:n])
+        - alpha * r[:, 1:n+1]
+        - beta_loc * (1/dx) * (u[:, 2:n+2] - u[:, 1:n+1])
+        + (kr/dx**2) * (r[:, 2:n+2] - 2*r[:, 1:n+1] + r[:, 0:n])
+    )
+
+    out = np.concatenate([du, dh, dr], axis=1)  # (N_ens, 3*n)
+
+    return out[0] if single else out
+
+def swm_step(x, t, dt):
+    """
+    DAPPER-compatible step function. Rain clipped to zero if negative.
+    x: shape (3*n,) for single realization, or (N_ens, 3*n) for ensemble
+    """
+    x_new = dp.mods.integration.rk4(lambda x, t: dxdt(x), x, t, dt)
+    # clip rain (indices 2n:3n) to non-negative
+    if x_new.ndim == 1:
+        x_new[2*n:] = np.maximum(x_new[2*n:], 0.0)
+    else:
+        x_new[:, 2*n:] = np.maximum(x_new[:, 2*n:], 0.0)
+    return x_new
+
+# =============================================================================
+# 2. Localization for LETKF
+# =============================================================================
+
+def make_localizer_1D_periodic(state_coord, obs_coord, n):
+    """
+    state_coord: 1D array, shape (3*n,), grid index for each state dim
+    obs_coord:   1D array, shape (Ny,),  grid index for each obs
+    n: domain size for periodic wrapping
+    """
+    def gaspari_cohn(r):
+        r = np.abs(r)
+        gc = np.zeros_like(r, dtype=float)
+        m1 = r < 0.5
+        gc[m1] = 1 - 6*r[m1]**2 + 6*r[m1]**3
+        m2 = (r >= 0.5) & (r < 1.0)
+        gc[m2] = 2*(1 - r[m2])**3
+        return gc
+
+    def localizer(loc_rad, direction, taper="GC"):
+        if direction == "x2y":
+            state_batches = [np.array([i]) for i in range(len(state_coord))]
+
+            def obs_taperer(ii):
+                s_pos = state_coord[ii[0]]           # fixed: 1D indexing
+                raw_dist = np.abs(obs_coord - s_pos)
+                dist = np.minimum(raw_dist, n - raw_dist)
+                within = dist <= loc_rad
+                oBatch = np.where(within)[0]
+                tapering = gaspari_cohn(dist[within] / loc_rad)
+                return oBatch, tapering
+
+            return state_batches, obs_taperer
+
+        elif direction == "y2x":
+            def state_taperer(j):
+                o_pos = obs_coord[j]                 # fixed: 1D indexing
+                raw_dist = np.abs(state_coord - o_pos)
+                dist = np.minimum(raw_dist, n - raw_dist)
+                within = dist <= loc_rad
+                ii = np.where(within)[0]
+                tapering = gaspari_cohn(dist[within] / loc_rad)
+                return ii, tapering
+
+            return state_taperer
+
+    return localizer
+
+# =============================================================================
+# 2. HMM
+# =============================================================================
+
+# Setup basic grid parameters matching SWM constants
+Nx = n*3  # State size (grid points * 3, that is the number of fields u, v, h)
+
+# Dynamic Model object in DAPPER
+Dyn = {
+    'M': Nx,
+    'model': swm_step,
+    'noise': 0,  # Set to a positive float/matrix if you want stochastic model noise
+}
+
+# Initial conditions distribution
+C_diag = np.ones(Nx)
+C_diag[0:n]    = 0.1    # u: ±0.3 m/s
+C_diag[n:2*n]  = 1.0    # h: ±1 m around 90 m mean
+C_diag[2*n:3*n] = 0.001 # r: tiny rain perturbations
+X0 = dp.tools.randvars.GaussRV(mu=mu, C=np.diag(C_diag))
+
+# Setup Observation Operators: observing h every 4th point
+obs_indices = np.arange(n, 2*n, 4)
+Ny = len(obs_indices)
+
+def hmod(x):
+    # Operator mapping state to observation space
+    return x[..., obs_indices]
+
+# Setup
+grid = np.arange(n)
+state_coord = np.concatenate([grid, grid, grid])  # shape (3*n,), 1D
+obs_grid    = np.arange(0, n, 4)
+obs_coord   = obs_grid.astype(float)              # shape (Ny,),  1D
+
+localizer = make_localizer_1D_periodic(state_coord, obs_coord, n)
+
+# Obs = {
+#     'M': Ny,
+#     'model': hmod,
+#     'noise': dp.tools.randvars.GaussRV(C= np.diag(np.ones(Ny))), # Observational error covariance, same as C_diag for h
+#     'localizer': localizer
+# }
+
+# NOTE: must be wrapped in an Operator (not a plain dict) since
+# HiddenMarkovModel only auto-converts Dyn dicts, not Obs dicts.
+Obs = dp.mods.Operator(
+    M=Ny,
+    model=hmod,
+    noise=dp.tools.randvars.GaussRV(C=np.diag(np.ones(Ny))),
+    localizer=localizer,
+)
+
+
+# Time sequences (dt must align with SWM's stable time stepping constraints)
+tseq = dp.mods.Chronology(dt=1.0, dto=5.0, T=100.0, BurnIn=10.0)
+
+# Put everything together into an HMM object
+HMM = dp.mods.HiddenMarkovModel(Dyn, Obs, tseq, X0)
+
+# =============================================================================
+# 3. RUN THE DA EXPERIMENT
+# =============================================================================
+
+# suggestions for LETKF
+# N=50 / N=70
+# loc_rad = 10 and infl = 1
+
+if __name__ == "__main__":
+    print("Generating synthetic truth and observations...")
+    # Generate true trajectory and noisy simulated observations
+    xx, yy = HMM.simulate()
+    
+    print("Setting up DA Method (EnKF)...")
+    # Configure an Ensemble Kalman Filter using DAPPER
+    xp = da.EnKF("Sqrt", N=150, infl=1.05, rot=True) 
+
+    xp.assimilate(HMM, xx, yy)
+
+    if __name__ == "__main__":
+    # =========================================================================
+    # 4. VISUALIZE RESULTS
+    # =========================================================================
+    tt = HMM.tseq.tt          # all integration times, shape (K+1,)
+    tto = HMM.tseq.tto        # obs times,             shape (Ko+1,)
+    kko = HMM.tseq.kko        # indices into tt/xx where obs occur
+
+    # Analysis-mean estimate of full state at every analysis (obs) time
+    mu_a = xp.stats.mu.a      # shape (Ko+1, Nx)
+
+    # Split fields: u, h, r
+    def split_fields(state_2d):
+        return state_2d[:, 0:n], state_2d[:, n:2*n], state_2d[:, 2*n:3*n]
+
+    u_truth, h_truth, r_truth = split_fields(xx[kko])   # truth at obs times
+    u_mu, h_mu, r_mu = split_fields(mu_a)               # analysis mean at obs times
+
+    # -------------------------------------------------------------------
+    # (a) Hovmoller diagrams: truth vs analysis mean vs error, for h
+    # -------------------------------------------------------------------
+    fig, axs = plt.subplots(1, 3, figsize=(15, 4), sharey=True)
+    vmin, vmax = h_truth.min(), h_truth.max()
+
+    im0 = axs[0].pcolormesh(np.arange(n), tto, h_truth, shading="auto", vmin=vmin, vmax=vmax)
+    axs[0].set_title("Truth: h(x,t)")
+    axs[0].set_xlabel("grid index x")
+    axs[0].set_ylabel("time")
+    plt.colorbar(im0, ax=axs[0])
+
+    im1 = axs[1].pcolormesh(np.arange(n), tto, h_mu, shading="auto", vmin=vmin, vmax=vmax)
+    axs[1].set_title("EnKF analysis mean: h(x,t)")
+    axs[1].set_xlabel("grid index x")
+    plt.colorbar(im1, ax=axs[1])
+
+    im2 = axs[2].pcolormesh(np.arange(n), tto, h_mu - h_truth, shading="auto", cmap="RdBu_r")
+    axs[2].set_title("Error: mean - truth")
+    axs[2].set_xlabel("grid index x")
+    plt.colorbar(im2, ax=axs[2])
+
+    fig.tight_layout()
+    plt.show()
+
+    # -------------------------------------------------------------------
+    # (b) RMSE and ensemble spread over time
+    # -------------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(tto, xp.stats.err.rms.a, label="RMSE (analysis)")
+    ax.plot(tto, xp.stats.spread.rms.a, label="Ensemble spread (analysis)", linestyle="--")
+    if hasattr(xp.stats.err.rms, "f"):
+        ax.plot(tto, xp.stats.err.rms.f, label="RMSE (forecast)", alpha=0.6)
+    ax.set_xlabel("time")
+    ax.set_ylabel("RMS over full state")
+    ax.set_title("DA performance: RMSE vs ensemble spread")
+    ax.legend()
+    fig.tight_layout()
+    plt.show()
+
+    # -------------------------------------------------------------------
+    # (c) Snapshot at final analysis time: truth vs mean vs observations
+    # -------------------------------------------------------------------
+    k_final = -1
+    fig, axs = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+
+    axs[0].plot(np.arange(n), u_truth[k_final], "k-", label="truth")
+    axs[0].plot(np.arange(n), u_mu[k_final], "r--", label="analysis mean")
+    axs[0].set_ylabel("u")
+    axs[0].legend()
+
+    axs[1].plot(np.arange(n), h_truth[k_final], "k-", label="truth")
+    axs[1].plot(np.arange(n), h_mu[k_final], "r--", label="analysis mean")
+    axs[1].scatter(obs_indices, yy[k_final], c="b", s=10, label="obs", zorder=5)
+    axs[1].set_ylabel("h")
+    axs[1].legend()
+
+    axs[2].plot(np.arange(n), r_truth[k_final], "k-", label="truth")
+    axs[2].plot(np.arange(n), r_mu[k_final], "r--", label="analysis mean")
+    axs[2].set_ylabel("r")
+    axs[2].set_xlabel("grid index x")
+    axs[2].legend()
+
+    fig.suptitle(f"State at final analysis time t={tto[k_final]:.1f}")
+    fig.tight_layout()
+    plt.show()
